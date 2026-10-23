@@ -1,0 +1,32 @@
+{
+  "name": "@pipeworx/mcp-fl-medicaid-rates",
+  "version": "0.1.0",
+  "description": "Florida Medicaid rate schedules (Florida AHCA, Medicaid cost reimbursement).",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "bin": {
+    "mcp-fl-medicaid-rates": "bin/cli.js"
+  },
+  "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "fl-medicaid-rates"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pipeworx-io/mcp-fl-medicaid-rates.git"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "@cloudflare/workers-types": "^4.20260405.1"
+  },
+  "pipeworx": {
+    "sourceHash": "v1-81a479cc85566cefccae5d27646a8e040b8aaf143d2ec50c7f90f33c8ac53e0a",
+    "sourceCommit": "70a4e816a9195016cd4af92dca2019485d4c3865"
+  }
+}
