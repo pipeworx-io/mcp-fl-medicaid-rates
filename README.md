@@ -2,7 +2,7 @@
 
 Florida Medicaid reimbursement rates by provider and rate semester: FQHC and rural health clinic per-visit encounter rates, nursing home, skilled nursing unit, swing bed, hospice and hospital rates, with statewide min/median/max and the effective date.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1881+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -63,8 +63,12 @@ node mcps/fl-medicaid-rates/scripts/refresh-rates.mjs --out <dir>  # write to a 
 node mcps/fl-medicaid-rates/scripts/refresh-rates.mjs --only fqhc,rhc --r2-mode wrangler
 ```
 
-Run it from a US machine at least monthly (it checks the country and refuses otherwise, because a refresh from a
-refused region would store nothing and still exit 0). Exit 0 only when every schedule was read and parsed, its
+The unattended refresh is the scheduled Worker `workers/fl-rates-refresh` (pinned to a US region; a daily tick that
+acts once the copy is 25 days old and retries on the next tick if a run fails). The script above is the operator's
+route for a manual or dry run, or if that Worker is down; both call the same loop (`src/refresh.ts`). The monitor's
+`_fl_rates_copy` check goes red at 38 days; the pack stops trusting the copy at 45. Either route runs from the US only
+(it checks the country and refuses otherwise, because a refresh from a refused region would store nothing and still
+exit 0). Exit 0 only when every schedule was read and parsed, its
 latest table cleared the row floor, and the manifest landed; any failure leaves the previous manifest, so
 `copy_refreshed_at` never claims a check that did not happen. A workbook whose content is unchanged keeps its
 object and its `retrieved_at`. R2 writes use `wrangler r2 object put --remote` under the operator login.
@@ -122,7 +126,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1879+ data sources. The
+Both URLs reach the same gateway and the same 1881+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
