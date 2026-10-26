@@ -2,7 +2,7 @@
 
 Florida Medicaid reimbursement rates by provider and rate semester: FQHC and rural health clinic per-visit encounter rates, nursing home, skilled nursing unit, swing bed, hospice and hospital rates, with statewide min/median/max and the effective date.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1875+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1879+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -18,7 +18,7 @@ Keyless.
 
 - Florida Agency for Health Care Administration (AHCA), Medicaid cost reimbursement rate schedules — the per-semester provider rate tables the agency publishes for each rate type. Public, no account.
 
-Each call reads the agency's current publication list and the one table asked for, so new semesters appear without a code change. Nothing is bundled. Tables are small, and parsed results are held for ten minutes within an isolate.
+Calls are answered from a stored copy of the agency's tables (see Stored copy below); a semester the copy does not list, or a copy older than 45 days, sends the call to the agency instead, so new semesters appear without a code change. Nothing is bundled in the gateway.
 
 Things worth knowing:
 
@@ -33,9 +33,50 @@ Things worth knowing:
 - A partial read is refused, not answered: the reader counts the cells it read against the cells in the sheet, refuses a workbook with a sheet it could not open or a data sheet with no header row, and refuses a latest table with fewer provider rows than a per-schedule floor.
 - Rate-letter and calculation-sheet PDFs, and the reimbursement plans, are not parsed.
 
-## Freshness and refusals
+## Stored copy and `data_as_of` (fleet #3614)
+
+The agency's firewall refuses our egress by REGION, not by caller: over one measured window every call routed
+through Hong Kong, Singapore or Shanghai was refused (467 refused against 25 served) while US callers were
+served. A cache cannot help a region that never gets a first success, and the rates change about twice a year,
+so the parsed tables are stored in the shared R2 store (`medicaid-rates/fl/`: a manifest plus one object per
+workbook, 95 objects and about 2.8 MB for 9 schedules). The gateway hands the pack its R2 binding; nothing is
+loaded at module scope and nothing is in git.
+
+- A call is answered from the copy with no request to the agency. The response carries `served_from:
+  "stored-copy"`, `retrieved_at` (when that workbook was read from the agency), `copy_refreshed_at` (when the
+  refresh last checked the whole set), and `data_as_of` (the rate semester's effective date; for
+  `fl_rate_periods`, the newest semester listed).
+- A copy older than 45 days is not trusted to be current: the agency is asked first, and the copy answers only
+  if that fails, with `stale_copy: true`, `stale_note` and `upstream_refused`. A period the copy does not list
+  also goes to the agency, and its failure names what the copy holds.
+- With no R2 binding (a standalone install) the pack reads the agency live, as before, with its one-day cache,
+  its ten-minute refused-region pause and an earlier-copy fallback labelled `upstream_refused`.
+- The same parser (`src/parse.ts`, `src/xlsx.ts`) writes the copy and reads the agency live, and the same
+  per-schedule row floors apply to a stored latest table, so a partial read is refused either way.
+
+### Refresh
+
+```
+node mcps/fl-medicaid-rates/scripts/refresh-rates.mjs              # read the agency, write R2 (changed files only)
+node mcps/fl-medicaid-rates/scripts/refresh-rates.mjs --dry-run    # read, parse, report; write nothing
+node mcps/fl-medicaid-rates/scripts/refresh-rates.mjs --out <dir>  # write to a directory instead of R2
+node mcps/fl-medicaid-rates/scripts/refresh-rates.mjs --only fqhc,rhc --r2-mode wrangler
+```
+
+Run it from a US machine at least monthly (it checks the country and refuses otherwise, because a refresh from a
+refused region would store nothing and still exit 0). Exit 0 only when every schedule was read and parsed, its
+latest table cleared the row floor, and the manifest landed; any failure leaves the previous manifest, so
+`copy_refreshed_at` never claims a check that did not happen. A workbook whose content is unchanged keeps its
+object and its `retrieved_at`. R2 writes use `wrangler r2 object put --remote` under the operator login.
+
+Licence: the tables are Florida public records (Fla. Stat. ch. 119), published on the agency's site with no
+reuse restriction stated on the pages; the copy republishes the agency's figures unchanged and names the agency.
+
+## Live-read behaviour (no stored copy, or a copy that cannot answer)
 
 Each file is read from the agency at most once a day per region and kept; `retrieved_at` is when the agency was last actually read and `from_cache` says whether this answer used a stored copy. If the agency refuses a fresh read and an earlier copy exists, the earlier copy answers and the response carries `upstream_refused` with the agency's reason. If it refuses and there is no earlier copy, the call fails and says why. The agency's firewall refuses requests from some regions; the pack does not disguise itself or rotate addresses.
+
+After the agency's firewall refuses a data centre, that data centre does not contact the agency again for ten minutes (the call fails at once and says so), so a caller retrying in a loop does not add load to the agency. A timeout or a 5xx never starts that pause.
 
 ## Quick Start
 
@@ -81,7 +122,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1875+ data sources. The
+Both URLs reach the same gateway and the same 1879+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

@@ -942,9 +942,9 @@ async function parseJsonBounded<T>(
  */
 
 import { parseXlsx } from './xlsx.js';
+import { HOST, SCHEDULES, SCHEDULE_IDS, parsePage, parseTable as parseTableWith, periodLabel, isIdColumn, selectFiles, MONTHS, type FileRef, type Table } from './parse.js';
 
 const UA = 'pipeworx-mcp-fl-medicaid-rates/1.0 (+https://pipeworx.io)';
-const HOST = 'https://ahca.myflorida.com';
 const SOURCE = 'Florida AHCA, Medicaid cost reimbursement rate schedules';
 
 async function pwFetch(url: string, init: RequestInit = {}): Promise<Response> {
@@ -1023,7 +1023,44 @@ function refusalMessage(what: string, status: number, body: string, ray: string 
   return `Florida AHCA ${what} answered HTTP ${status}${body ? `: ${summarizeErrorBody(body)}` : ''}${relayNote}`;
 }
 
+// A refusal is remembered for ten minutes per data centre (fleet #3518 follow-up).
+// One caller in Asia was retrying about 20 times an hour and every retry was a
+// request to the agency's firewall that could only be refused again; after the
+// first refusal the data centre stops asking until the marker expires. The
+// marker is only written for a firewall block page, never for a timeout or a 5xx.
+const BLOCK_MARK_MS = 10 * 60 * 1000;
+const BLOCK_KEY = 'https://fl-medicaid-rates.pipeworx.invalid/refused';
+
+async function blockGet(): Promise<string | null> {
+  if (typeof caches === 'undefined') return null;
+  try {
+    const hit = await caches.default.match(new Request(BLOCK_KEY));
+    if (!hit) return null;
+    const at = Number(hit.headers.get(FETCHED_AT) ?? 0);
+    if (!at || Date.now() - at > BLOCK_MARK_MS) return null;
+    return await hit.text();
+  } catch {
+    return null;
+  }
+}
+
+async function blockPut(message: string): Promise<void> {
+  if (typeof caches === 'undefined') return;
+  try {
+    await caches.default.put(
+      new Request(BLOCK_KEY),
+      new Response(message, { headers: { 'Cache-Control': 's-maxage=600', [FETCHED_AT]: String(Date.now()) } }),
+    );
+  } catch {
+    /* a failed marker write only costs one more refused request */
+  }
+}
+
 async function liveBytes(url: string, what: string): Promise<Uint8Array> {
+  if (!PROXY) {
+    const earlier = await blockGet();
+    if (earlier) throw new Error(`${earlier} Not asked again: this data centre was refused within the last ten minutes, so the agency was not contacted for this call.`);
+  }
   const res = await pwFetch(url);
   if (res.ok) return new Uint8Array(await res.arrayBuffer());
   const body = (await res.text().catch(() => '')).slice(0, 4000);
@@ -1041,7 +1078,9 @@ async function liveBytes(url: string, what: string): Promise<Uint8Array> {
       relayNote = ' The egress relay was tried and did not answer.';
     }
   }
-  throw new Error(refusalMessage(what, res.status, body, res.headers.get('cf-ray'), relayNote));
+  const message = refusalMessage(what, res.status, body, res.headers.get('cf-ray'), relayNote);
+  if (res.status === 403 && /firewall block page/.test(message)) await blockPut(message);
+  throw new Error(message);
 }
 
 type Read<T> = { value: T; fetchedAt: number; refused?: string };
@@ -1080,88 +1119,10 @@ async function readThrough<T>(url: string, what: string, parse: (b: Uint8Array) 
   return { value, fetchedAt: Date.now() };
 }
 
-type Schedule = {
-  page: string;
-  label: string;
-  file: RegExp;
-  exclude?: RegExp;
-  /** Floor for the LATEST file's provider rows. Below it the read is treated as partial and refused. */
-  minRows: number;
-  /** What the published table covers, when that is narrower than its heading suggests. */
-  scope?: string;
-};
-
-const SCHEDULES: Record<string, Schedule> = {
-  fqhc: { page: 'fqhc-rhc-rates', label: 'Federally Qualified Health Center (FQHC) per-visit PPS encounter rate', file: /^FQHC[_ ]Rates/i, minRows: 300 },
-  rhc: { page: 'fqhc-rhc-rates', label: 'Rural Health Clinic (RHC) per-visit PPS encounter rate', file: /^RHC[_ ]Rates/i, minRows: 80 },
-  pb_rhc: { page: 'fqhc-rhc-rates', label: 'Provider-based Rural Health Clinic per-visit rate', file: /^PB-RHC[_ ]Rates/i, minRows: 8 },
-  snu: { page: 'skilled-nursing-unit-snu-rates', label: 'Skilled nursing unit per diem rate', file: /SNU[_ ]Rates/i, minRows: 2,
-    scope: 'The agency posts per diem rates for the hospital-based skilled nursing units it lists in this table (3 units in the October 2026 table); it is the complete published table, not a sample, and it is not a list of every nursing facility -- see the nursing_home schedule for those.' },
-  swing_bed: { page: 'swing-bed-rates', label: 'Swing bed per diem rate', file: /SB[_ ]Rates/i, minRows: 4 },
-  hospice_level_of_care: { page: 'hospice-care-services-per-diem-rates', label: 'Hospice level-of-care per diem rates', file: /Hospice[_ ]LOC[_ ]Rates/i, minRows: 40 },
-  hospice_room_board: { page: 'hospice-room-board-rates', label: 'Hospice nursing home room and board rate', file: /Hospice[_ ]R-B[_ ]Rates/i, minRows: 40 },
-  nursing_home: { page: 'nursing-home-rates', label: 'Nursing home final per diem rate', file: /NH[_ ]Final[_ ]Rates/i, exclude: /detail/i, minRows: 400 },
-  hospital: {
-    page: 'hospital-rates-ambulatory-surgical-centers',
-    label: 'State mental health hospital per diem rates',
-    file: /Hospital[_ ]Rates/i,
-    minRows: 3,
-    scope:
-      'STATE MENTAL HEALTH HOSPITALS ONLY. Since July 2013 the agency pays community-hospital inpatient stays by diagnosis-related group, and since July 2017 outpatient by enhanced ambulatory patient group; it posts no per diem for those hospitals. The only hospitals still paid a per diem, and so the only rows in this table, are the state mental health hospitals (3 in the July 2026 table). A community hospital is not missing from the data -- it is not in this schedule. Per diem columns that read 0 mean no per diem is paid for that service (null here).',
-  },
-};
-const SCHEDULE_IDS = Object.keys(SCHEDULES);
-
-const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
-const MONTH_NAMES = MONTHS.map((m) => m[0].toUpperCase() + m.slice(1));
-
-function iso(y: number, m: number, d = 1): string | null {
-  if (y < 2000 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return null;
-  return `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
-}
-
-/** Effective date implied by a published file's name (first day of the semester). */
-function effectiveFromName(name: string): string | null {
-  let m = /(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[_ ]+(\d{4})/i.exec(name);
-  if (m) return iso(+m[2], MONTHS.findIndex((x) => x.startsWith(m![1].toLowerCase())) + 1);
-  m = /(\d{4})-(\d{2})-(\d{2})/.exec(name);
-  if (m) return iso(+m[1], +m[2], +m[3]);
-  m = /(?<!\d)(\d{1,2})-(\d{1,2})-(\d{4})/.exec(name);
-  if (m) return iso(+m[3], +m[1], +m[2]);
-  m = /(\d{4})-(\d{2})(?!\d)/.exec(name);
-  if (m) return iso(+m[1], +m[2]);
-  m = /(?<!\d)(20\d{2})(\d{2})(?!\d)/.exec(name);
-  if (m) return iso(+m[1], +m[2]);
-  m = /(?<!\d)(\d{1,2})-(20\d{2})(?!\d)/.exec(name);
-  if (m) return iso(+m[2], +m[1]);
-  return null;
-}
-
-function periodLabel(effective: string | null): string | null {
-  if (!effective) return null;
-  const [y, mo] = effective.split('-');
-  return `${MONTH_NAMES[+mo - 1]} ${y}`;
-}
-
-type FileRef = { url: string; effective: string | null };
 type Meta = { fetchedAt: number; refused?: string };
 
 const TTL = 10 * 60 * 1000;
 const pageCache = new Map<string, { at: number; files: FileRef[]; meta: Meta }>();
-
-function parsePage(html: string): FileRef[] {
-  const files: FileRef[] = [];
-  const seen = new Set<string>();
-  for (const m of html.matchAll(/href="([^"]+\.xlsx)"/gi)) {
-    let url: string;
-    try { url = new URL(m[1].replace(/ /g, '%20'), `${HOST}/medicaid/cost-reimbursement/`).toString(); } catch { continue; }
-    if (seen.has(url)) continue;
-    seen.add(url);
-    files.push({ url, effective: effectiveFromName(decodeURIComponent(url.split('/').pop() ?? '')) });
-  }
-  if (!files.length) throw new Error('Florida AHCA rate page listed no workbooks -- the page layout may have changed');
-  return files;
-}
 
 async function listFiles(id: string): Promise<{ files: FileRef[]; meta: Meta }> {
   const sch = SCHEDULES[id];
@@ -1177,12 +1138,7 @@ async function listFiles(id: string): Promise<{ files: FileRef[]; meta: Meta }> 
     meta = { fetchedAt: r.fetchedAt, refused: r.refused };
     pageCache.set(sch.page, { at: Date.now(), files: all, meta });
   }
-  const files = all
-    .filter((f) => {
-      const n = decodeURIComponent(f.url.split('/').pop() ?? '');
-      return sch.file.test(n) && !(sch.exclude && sch.exclude.test(n));
-    })
-    .sort((a, b) => (b.effective ?? '').localeCompare(a.effective ?? ''));
+  const files = selectFiles(all, sch);
   return { files, meta };
 }
 
@@ -1200,101 +1156,16 @@ function normPeriod(p: string): { prefix: string } | null {
   throw new Error(`Unrecognised period "${p}". Use "latest", a year ("2025"), a month ("2025-10") or "October 2025".`);
 }
 
-type Table = { columns: string[]; rows: Record<string, string | number | null>[]; zeroCells: Record<string, number> };
 
 const bookCache = new Map<string, { at: number; table: Table; meta: Meta }>();
-
-function clean(v: string | number | undefined): string {
-  return String(v ?? '').replace(/\s+/g, ' ').trim();
-}
 
 async function loadTable(url: string): Promise<{ table: Table; meta: Meta }> {
   const hit = bookCache.get(url);
   if (hit && Date.now() - hit.at < TTL) return { table: hit.table, meta: hit.meta };
-  const r = await readThrough(url, 'rate file', parseTable);
+  const r = await readThrough(url, 'rate file', (b) => parseTableWith(b, parseXlsx));
   const meta = { fetchedAt: r.fetchedAt, refused: r.refused };
   bookCache.set(url, { at: Date.now(), table: r.value, meta });
   return { table: r.value, meta };
-}
-
-async function parseTable(bytes: Uint8Array): Promise<Table> {
-  const wb = await parseXlsx(bytes);
-  // Refuse a partial read rather than answer from whatever rows survived.
-  if (wb.unreadSheets.length) throw new Error(`Florida AHCA rate file has sheet(s) this reader could not open (${wb.unreadSheets.join(', ')}) -- refusing to answer from a partial read`);
-  for (const sh of wb.sheets) {
-    if (sh.cellsRead !== sh.cellsDeclared) throw new Error(`Florida AHCA rate file sheet "${sh.name}" is incompletely read (${sh.cellsRead} of ${sh.cellsDeclared} cells) -- refusing to answer from a partial read`);
-  }
-  const columns: string[] = [];
-  const rows: Record<string, string | number | null>[] = [];
-  const multi = wb.sheets.length > 1;
-  for (const sh of wb.sheets) {
-    const rowNums = [...sh.rows.keys()].sort((a, b) => a - b);
-    let headerRow = -1;
-    for (const rn of rowNums.slice(0, 12)) {
-      const cells = [...sh.rows.get(rn)!.values()];
-      if (cells.length >= 3 && cells.every((c) => typeof c === 'string')) { headerRow = rn; break; }
-    }
-    if (headerRow < 0) {
-      if (sh.cellsRead > 0) throw new Error(`Florida AHCA rate file sheet "${sh.name}" has data but no recognisable header row -- layout may have changed; refusing to answer from a partial read`);
-      continue;
-    }
-    const hdr = sh.rows.get(headerRow)!;
-    const letters = [...hdr.keys()];
-    const names = new Map<string, string>();
-    for (const L of letters) {
-      let n = clean(hdr.get(L));
-      if (!n) continue;
-      let k = n, i = 2;
-      while (names.has(k) && names.get(k) !== L) k = `${n} (${i++})`;
-      names.set(L, k);
-      if (!columns.includes(k)) columns.push(k);
-    }
-    for (const rn of rowNums) {
-      if (rn <= headerRow) continue;
-      const r = sh.rows.get(rn)!;
-      const rec: Record<string, string | number> = {};
-      let numeric = 0;
-      for (const L of letters) {
-        const v = r.get(L);
-        if (v === undefined) continue;
-        const name = names.get(L);
-        if (!name) continue;
-        rec[name] = typeof v === 'string' ? clean(v) : v;
-        if (typeof v === 'number') numeric++;
-      }
-      if (numeric === 0 && Object.keys(rec).length < 2) continue;
-      if (multi) rec['Sheet'] = sh.name;
-      rows.push(rec);
-    }
-  }
-  if (multi && !columns.includes('Sheet')) columns.push('Sheet');
-  // Excel serial dates in an "effective date" column -> ISO.
-  for (const c of columns) {
-    if (!/date/i.test(c)) continue;
-    for (const r of rows) {
-      const v = r[c];
-      if (typeof v === 'number' && v > 30000 && v < 80000) r[c] = new Date(Math.round((v - 25569) * 86400000)).toISOString().slice(0, 10);
-    }
-  }
-  if (!rows.length) throw new Error('Florida AHCA rate file parsed to zero rows -- layout may have changed');
-  // The agency states money to the cent; some workbooks store float noise (159.18499999999997).
-  // Round half-up to cents at this one boundary, in every rate column of every schedule.
-  // A 0 in a rate column is the agency's "no rate for this service", not a price: null it.
-  const zeroCells: Record<string, number> = {};
-  for (const c of columns) {
-    if (isIdColumn(c)) continue;
-    for (const r of rows) {
-      const v = r[c];
-      if (typeof v !== 'number') continue;
-      if (v === 0) { (r as Record<string, string | number | null>)[c] = null; zeroCells[c] = (zeroCells[c] ?? 0) + 1; continue; }
-      r[c] = Math.round(v * 100 + 1e-6) / 100;
-    }
-  }
-  return { columns, rows, zeroCells };
-}
-
-function isIdColumn(name: string): boolean {
-  return /number|^id$|npi|provider|medicaid no|name|sheet|date|^#$/i.test(name);
 }
 
 function stats(vals: number[]) {
@@ -1305,15 +1176,157 @@ function stats(vals: number[]) {
   return { count: n, min: r(s[0]), median: r(med), max: r(s[n - 1]), mean: r(s.reduce((a, b) => a + b, 0) / n) };
 }
 
-async function resolveFile(id: string, period: unknown): Promise<{ file: FileRef; available: string[]; latest: FileRef; meta: Meta }> {
-  const { files, meta } = await listFiles(id);
+// ---------------------------------------------------------------------------
+// The stored copy (fleet #3614).
+//
+// AHCA's firewall refuses our egress outside the US, so a caller routed through Hong Kong,
+// Singapore or Shanghai never got a first success for a day cache to fall back on (467 refused
+// against 25 served over one window; US callers were served). The rate workbooks change about
+// twice a year, so they are stored: scripts/refresh-rates.mjs reads the agency from a US
+// machine with the same parser this file uses and writes the PARSED tables to the shared R2
+// store (`medicaid-rates/fl/`). The gateway hands the pack its R2 binding (manifest injectR2).
+// A call is answered from the stored copy with no request to the agency, and says so
+// (`served_from: "stored-copy"`, `copy_refreshed_at`). Nothing is loaded at module scope: the
+// data never enters the gateway bundle.
+//
+// A copy older than STALE_AFTER_MS is not trusted to be current: the live agency is asked
+// first, and the copy answers only if that fails, labelled `stale_copy: true`. A period the
+// copy does not list (a semester published since the last refresh) also goes to the agency.
+// ---------------------------------------------------------------------------
+
+type R2Like = { get(key: string): Promise<{ text(): Promise<string> } | null> };
+let R2: R2Like | null = null;
+
+const STORE = 'medicaid-rates/fl';
+const STALE_AFTER_MS = 45 * 24 * 60 * 60 * 1000;
+const MEMO_TTL_MS = 10 * 60 * 1000;
+const MEMO_MAX = 8;
+
+type StoredRef = { key: string; effective: string | null; name: string; retrieved_at: string; rows: number };
+type StoredManifest = { refreshed_at: string; schedules: Record<string, StoredRef[]> };
+type StoredFile = { effective: string | null; retrieved_at: string; columns: string[]; rows: Table['rows']; zeroCells: Record<string, number> };
+
+let manifestMemo: { at: number; doc: StoredManifest } | null = null;
+const fileMemo = new Map<string, { at: number; doc: StoredFile }>();
+
+async function r2Json(key: string): Promise<unknown | null> {
+  if (!R2 || typeof R2.get !== 'function') return null;
+  try {
+    const obj = await R2.get(`${STORE}/${key}`);
+    if (!obj) return null;
+    return JSON.parse(await obj.text());
+  } catch {
+    return null;
+  }
+}
+
+async function storedManifest(): Promise<StoredManifest | null> {
+  if (manifestMemo && Date.now() - manifestMemo.at < MEMO_TTL_MS) return manifestMemo.doc;
+  const d = (await r2Json('_manifest.json')) as StoredManifest | null;
+  if (!d || typeof d.refreshed_at !== 'string' || !Number.isFinite(Date.parse(d.refreshed_at)) || !d.schedules || typeof d.schedules !== 'object') return null;
+  manifestMemo = { at: Date.now(), doc: d };
+  return d;
+}
+
+async function storedFile(ref: StoredRef): Promise<StoredFile | null> {
+  const hit = fileMemo.get(ref.key);
+  if (hit && Date.now() - hit.at < MEMO_TTL_MS) return hit.doc;
+  const d = (await r2Json(ref.key)) as StoredFile | null;
+  if (!d || !Array.isArray(d.columns) || !Array.isArray(d.rows) || !d.rows.length || typeof d.retrieved_at !== 'string') return null;
+  fileMemo.delete(ref.key);
+  fileMemo.set(ref.key, { at: Date.now(), doc: d });
+  while (fileMemo.size > MEMO_MAX) fileMemo.delete(fileMemo.keys().next().value as string);
+  return d;
+}
+
+/** What a rate answer is built from, whichever way it was read. */
+type View = {
+  effective: string | null;
+  available: string[];
+  isLatest: boolean;
+  table: Table;
+  prov: Record<string, unknown>;
+};
+
+function pickFile<F extends { effective: string | null }>(id: string, files: F[], period: unknown): { file: F | null; available: string[]; latest: F } {
   if (!files.length) throw new Error(`No published ${id} rate files found on the Florida AHCA page -- the page layout may have changed`);
-  const labels = [...new Set(files.map((f) => periodLabel(f.effective) ?? 'undated'))];
+  const available = [...new Set(files.map((f) => periodLabel(f.effective) ?? 'undated'))];
   const want = typeof period === 'string' ? normPeriod(period) : null;
-  if (!want) return { file: files[0], available: labels, latest: files[0], meta };
-  const hit = files.find((f) => f.effective?.startsWith(want.prefix));
-  if (!hit) throw new Error(`No ${id} rate schedule for period "${period}". Published periods: ${labels.join(', ')}`);
-  return { file: hit, available: labels, latest: files[0], meta };
+  if (!want) return { file: files[0], available, latest: files[0] };
+  return { file: files.find((f) => f.effective?.startsWith(want.prefix)) ?? null, available, latest: files[0] };
+}
+
+type StoredHit = { kind: 'hit'; view: View; refreshedAt: number } | { kind: 'miss'; available: string[]; refreshedAt: number };
+
+/** Null when there is no store, or it holds nothing for this schedule. */
+async function storedView(id: string, period: unknown): Promise<StoredHit | null> {
+  const m = await storedManifest();
+  const refs = m?.schedules[id];
+  if (!m || !refs?.length) return null;
+  const sorted = [...refs].sort((a, b) => (b.effective ?? '').localeCompare(a.effective ?? ''));
+  const { file, available, latest } = pickFile(id, sorted, period);
+  const refreshedAt = Date.parse(m.refreshed_at);
+  if (!file) return { kind: 'miss', available, refreshedAt };
+  const doc = await storedFile(file);
+  if (!doc) return null;
+  return {
+    kind: 'hit',
+    refreshedAt,
+    view: {
+      effective: file.effective,
+      available,
+      isLatest: file === latest,
+      table: { columns: doc.columns, rows: doc.rows, zeroCells: doc.zeroCells ?? {} },
+      prov: storedProvenance(doc.retrieved_at, m.refreshed_at),
+    },
+  };
+}
+
+function storedProvenance(retrievedAt: string, refreshedAt: string): Record<string, unknown> {
+  return {
+    served_from: 'stored-copy',
+    retrieved_at: retrievedAt,
+    copy_refreshed_at: refreshedAt,
+    from_cache: true,
+    copy_note: 'Answered without contacting the agency: the tables were read from the agency on retrieved_at and last checked against it on copy_refreshed_at.',
+  };
+}
+
+function staleProvenance(base: Record<string, unknown>, refreshedAt: number, why: string): Record<string, unknown> {
+  const days = Math.floor((Date.now() - refreshedAt) / 86_400_000);
+  return {
+    ...base,
+    stale_copy: true,
+    stale_note: `These figures were last checked against the agency ${days} days ago (more than ${Math.floor(STALE_AFTER_MS / 86_400_000)}), and the agency could not be read just now, so a rate semester published since then would be missing. Treat them as possibly out of date.`,
+    upstream_refused: why,
+  };
+}
+
+async function liveView(id: string, period: unknown): Promise<{ view: View | null; available: string[] }> {
+  const { files, meta: pageMeta } = await listFiles(id);
+  const { file, available, latest } = pickFile(id, files, period);
+  if (!file) return { view: null, available };
+  const { table, meta: fileMeta } = await loadTable(file.url);
+  const p = provenance(pageMeta, fileMeta);
+  return { view: { effective: file.effective, available, isLatest: file === latest, table, prov: { served_from: p.from_cache ? 'day-cache' : 'live', ...p } }, available };
+}
+
+/** Stored copy first while it is fresh; the agency when it is not; a stale copy only if the agency fails. */
+async function readView(id: string, period: unknown): Promise<View> {
+  const stored = await storedView(id, period);
+  const fresh = stored && Date.now() - stored.refreshedAt < STALE_AFTER_MS;
+  if (stored?.kind === 'hit' && fresh) return stored.view;
+  try {
+    const { view, available } = await liveView(id, period);
+    if (view) return view;
+    throw new Error(`No ${id} rate schedule for period "${period}". Published periods: ${available.join(', ')}`);
+  } catch (err) {
+    if (stored?.kind === 'hit') return { ...stored.view, prov: staleProvenance(stored.view.prov, stored.refreshedAt, (err as Error).message) };
+    if (stored?.kind === 'miss' && !/Published periods/.test((err as Error).message)) {
+      throw new Error(`${(err as Error).message} The stored copy (refreshed ${new Date(stored.refreshedAt).toISOString().slice(0, 10)}) has no "${period}" either; it lists: ${stored.available.join(', ')}.`);
+    }
+    throw err;
+  }
 }
 
 /** When the agency was last actually read, and whether an earlier copy answered because the agency refused. */
@@ -1330,12 +1343,33 @@ function provenance(...metas: Meta[]): Record<string, unknown> {
   };
 }
 
+/**
+ * The answer to a provider filter that matches nothing. The schedules list each
+ * provider by NAME and Medicaid number only -- no city, county or address -- so a
+ * caller who types a place ("Seminole", "Ocala") is asking a question the table
+ * cannot answer, and "try a shorter fragment" gave them nothing to act on (fleet
+ * #3620: 59 such calls in two hours). Say what the table holds, and offer the
+ * nearest names when part of the fragment does appear in one.
+ */
+export function noProviderMessage(id: string, provider: string, period: string | null, table: Table): string {
+  const nameCols = table.columns.filter((c) => /name/i.test(c));
+  const names = table.rows.map((r) => nameCols.map((c) => String(r[c] ?? '')).find((v) => v) ?? '').filter(Boolean);
+  const tokens = provider.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 4);
+  const near = [...new Set(names.filter((n) => tokens.some((t) => n.toLowerCase().includes(t))))].slice(0, 5);
+  return (
+    `No ${id} provider matching "${provider}" in the ${period} schedule (${table.rows.length} providers listed). ` +
+    `This schedule lists providers by name and Medicaid provider number only -- it has no city, county or address column -- so a place name matches only when it appears inside a provider's name. ` +
+    (near.length
+      ? `Providers whose names contain part of your text: ${near.join('; ')}. `
+      : `No provider name contains any word of your text. `) +
+    `Search by a name fragment or a provider number, or omit "provider" to get the statewide figures and the first rows.`
+  );
+}
+
 async function rates(id: string, args: Record<string, unknown>) {
   if (!SCHEDULES[id]) throw new Error(`Unknown schedule "${id}". Valid: ${SCHEDULE_IDS.join(', ')}`);
-  const { file, available, latest, meta: pageMeta } = await resolveFile(id, args.period);
-  const { table, meta: fileMeta } = await loadTable(file.url);
-  const source = provenance(pageMeta, fileMeta);
-  const isLatest = file === latest;
+  const { effective, available, isLatest, table, prov } = await readView(id, args.period);
+  const file = { effective };
   const floor = SCHEDULES[id].minRows;
   if (isLatest && table.rows.length < floor) {
     throw new Error(`Florida AHCA ${id} schedule read ${table.rows.length} provider rows, below the ${floor} expected for the latest table -- treating it as a partial read and refusing to answer from it. Retry; if it persists the agency's table layout has changed.`);
@@ -1360,7 +1394,7 @@ async function rates(id: string, args: Record<string, unknown>) {
         return false;
       }),
     );
-    if (!matched.length) throw new Error(`No ${id} provider matching "${args.provider}" in the ${periodLabel(file.effective)} schedule (${table.rows.length} providers listed). Try a shorter name fragment or the provider number.`);
+    if (!matched.length) throw new Error(noProviderMessage(id, String(args.provider), periodLabel(file.effective), table));
   }
   const out: Record<string, unknown> = {
     schedule: id,
@@ -1376,7 +1410,7 @@ async function rates(id: string, args: Record<string, unknown>) {
     rows: matched.slice(0, limit),
     source: SOURCE,
     data_as_of: file.effective,
-    ...source,
+    ...prov,
     ...(SCHEDULES[id].scope ? { scope: SCHEDULES[id].scope } : {}),
     ...(Object.keys(table.zeroCells).length
       ? {
@@ -1389,6 +1423,27 @@ async function rates(id: string, args: Record<string, unknown>) {
   };
   if (matched.length > limit) out.truncated = true;
   return out;
+}
+
+type PeriodsRead = { files: { effective: string | null }[]; prov: Record<string, unknown> };
+
+/** The published periods for one schedule, by the same store-then-agency order as a rate read. */
+async function readPeriods(id: string): Promise<PeriodsRead> {
+  const m = await storedManifest();
+  const refs = m?.schedules[id];
+  const stored: PeriodsRead | null = m && refs?.length
+    ? { files: [...refs].sort((a, b) => (b.effective ?? '').localeCompare(a.effective ?? '')), prov: storedProvenance(refs.map((r) => r.retrieved_at).sort()[0], m.refreshed_at) }
+    : null;
+  const refreshedAt = m ? Date.parse(m.refreshed_at) : 0;
+  if (stored && Date.now() - refreshedAt < STALE_AFTER_MS) return stored;
+  try {
+    const { files, meta } = await listFiles(id);
+    const p = provenance(meta);
+    return { files, prov: { served_from: p.from_cache ? 'day-cache' : 'live', ...p } };
+  } catch (err) {
+    if (stored) return { files: stored.files, prov: staleProvenance(stored.prov, refreshedAt, (err as Error).message) };
+    throw err;
+  }
 }
 
 const scheduleEnum = SCHEDULE_IDS;
@@ -1434,6 +1489,7 @@ const tools: McpToolExport['tools'] = [
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
   // The gateway hands the egress relay's address and token to packs that need it.
+  R2 = args._r2 && typeof (args._r2 as R2Like).get === 'function' ? (args._r2 as R2Like) : null;
   PROXY = typeof args._proxyUrl === 'string' && typeof args._proxyToken === 'string' ? { url: args._proxyUrl, token: args._proxyToken } : null;
   switch (name) {
     case 'fl_fqhc_rates':
@@ -1443,11 +1499,13 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
     case 'fl_rate_periods': {
       const ids = typeof args.schedule === 'string' && args.schedule ? [args.schedule] : SCHEDULE_IDS;
       const schedules = [];
-      const metas: Meta[] = [];
+      const provs: Record<string, unknown>[] = [];
+      let latestAsOf: string | null = null;
       for (const id of ids) {
         if (!SCHEDULES[id]) throw new Error(`Unknown schedule "${id}". Valid: ${SCHEDULE_IDS.join(', ')}`);
-        const { files, meta } = await listFiles(id);
-        metas.push(meta);
+        const { files, prov } = await readPeriods(id);
+        provs.push(prov);
+        if (files[0]?.effective && (!latestAsOf || files[0].effective > latestAsOf)) latestAsOf = files[0].effective;
         schedules.push({
           schedule: id,
           description: SCHEDULES[id].label,
@@ -1455,7 +1513,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
           periods: files.map((f) => ({ period: periodLabel(f.effective) ?? 'undated', effective_date: f.effective })),
         });
       }
-      return { schedules, source: SOURCE, ...(metas.length ? provenance(...metas) : { retrieved_at: new Date().toISOString() }) };
+      // One schedule read from the agency while another came from the copy: report the weakest claim.
+      const worst = provs.find((p) => p.stale_copy) ?? provs.find((p) => p.served_from !== 'stored-copy') ?? provs[0];
+      return { schedules, source: SOURCE, data_as_of: latestAsOf, ...worst };
     }
     default:
       throw new Error(`Unknown tool: ${name}`);
