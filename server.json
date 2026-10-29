@@ -3,7 +3,7 @@
   "name": "io.github.pipeworx-io/fl-medicaid-rates",
   "title": "Fl Medicaid Rates",
   "description": "Florida Medicaid rate schedules (Florida AHCA, Medicaid cost reimbursement).",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "websiteUrl": "https://pipeworx.io/packs/fl-medicaid-rates",
   "repository": {
     "url": "https://github.com/pipeworx-io/mcp-fl-medicaid-rates",

@@ -1,12 +1,20 @@
 {
   "name": "@pipeworx/mcp-fl-medicaid-rates",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Florida Medicaid rate schedules (Florida AHCA, Medicaid cost reimbursement).",
   "type": "module",
-  "main": "src/index.ts",
-  "types": "src/index.ts",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools.json": "./tools.json",
+    "./package.json": "./package.json"
+  },
   "bin": {
     "mcp-fl-medicaid-rates": "bin/cli.js"
+  },
+  "files": ["bin/", "lib/", "tools.json", "server.json"],
+  "engines": {
+    "node": ">=18"
   },
   "keywords": ["mcp", "mcp-server", "model-context-protocol", "pipeworx", "fl-medicaid-rates"],
   "license": "MIT",
@@ -14,19 +22,12 @@
     "type": "git",
     "url": "git+https://github.com/pipeworx-io/mcp-fl-medicaid-rates.git"
   },
-  "scripts": {
-    "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
-    "tsx": "^4.19.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "@cloudflare/workers-types": "^4.20260405.1"
-  },
+  "mcpName": "io.github.pipeworx-io/fl-medicaid-rates",
   "pipeworx": {
-    "sourceHash": "v1-7461c50e2bc55b50a5e8b7ab4edd05f9e9435379ca7d6929ea8b5428afdf675d",
-    "sourceCommit": "24e32b525f9c0b2fd7d94b519b08abb108cc11cd"
+    "mode": "gateway",
+    "slug": "fl-medicaid-rates",
+    "gatewaySlug": "fl-medicaid-rates",
+    "sourceHash": "v1-bc8ba7366a5d9811a8fc5e03de578ed1266f463c49ac059aa5a415169cf5308f",
+    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
   }
 }
