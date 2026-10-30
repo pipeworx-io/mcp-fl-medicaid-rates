@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-fl-medicaid-rates",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Florida Medicaid rate schedules (Florida AHCA, Medicaid cost reimbursement).",
   "type": "module",
   "main": "lib/index.js",
@@ -28,6 +28,6 @@
     "slug": "fl-medicaid-rates",
     "gatewaySlug": "fl-medicaid-rates",
     "sourceHash": "v1-bc8ba7366a5d9811a8fc5e03de578ed1266f463c49ac059aa5a415169cf5308f",
-    "sourceCommit": "bb047243cf27f32453103de186b8e6a8b6a1ce79"
+    "sourceCommit": "06a6b405041923c5ddf2ac2436e7c049e635f464"
   }
 }
